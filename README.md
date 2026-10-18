@@ -10,7 +10,7 @@ Status: 0.1. The proxy is tested over stdio against five dbt projects in one rep
 
 `dbt lsp` serves one project per process. It needs `--project-dir`, ignores further workspace folders and does not advertise workspace-folder support (verified on 2.0.8). dbt's VS Code extension therefore runs one server per project and picks one by the active file's project root. Zed runs one server per worktree and reports subprojects as workspace folders, which `dbt lsp` ignores.
 
-This proxy does on the server side what the VS Code extension does on the client side. It becomes unnecessary once `dbt lsp` serves several projects itself; `docs/upstream/` holds the feature request draft.
+This proxy does on the server side what the VS Code extension does on the client side. It becomes unnecessary once `dbt lsp` serves several projects itself, which [dbt-labs/dbt#16801](https://github.com/dbt-labs/dbt/issues/16801) asks for.
 
 ## How it works
 
@@ -49,7 +49,7 @@ Any LSP client can start it as a stdio server. For Zed, see [`editors/zed`](edit
 
 ## Known limitations
 
-- `dbt lsp` answers nothing for documents whose path differs from its canonical project path, for example a checkout reached through a symlink (macOS `/tmp` is one).
+- `dbt lsp` answers nothing for documents whose path differs from its canonical project path, for example a checkout reached through a symlink (macOS `/tmp` is one). Reported in [dbt-labs/dbt#16800](https://github.com/dbt-labs/dbt/issues/16800).
 - Fusion's parser flags some DuckDB syntax (`struct_pack(*columns)`, `unnest … with ordinality`) as `dbt0101` warnings. `--static-analysis off` in the server command silences them; hover, definition and completion keep working.
 - `dbt lsp` 2.0.8 analyses files as saved: after an edit, hover in that file stays empty until the file is saved. It offers no hover on model entries in schema YAML.
 - A server that crashes restarts with the next document opened in its project. Documents that were already open stay without answers until reopened or until the language server is restarted.

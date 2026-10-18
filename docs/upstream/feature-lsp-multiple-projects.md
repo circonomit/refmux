@@ -1,7 +1,6 @@
-# Draft: [Feature] `dbt lsp`: serve several dbt projects from one language server
+# [Feature] `dbt lsp`: serve several dbt projects from one language server
 
-Not filed yet. Form: https://github.com/dbt-labs/dbt/issues/new?template=feature-request.yml
-Duplicate search on 2026-10-18 found nothing; related VS Code extension issues: #13721, #13758.
+Filed 2026-10-18 as https://github.com/dbt-labs/dbt/issues/16801 (text below as filed). Duplicate search the same day found nothing; related VS Code extension issues: #13721, #13758.
 
 ---
 
@@ -48,3 +47,5 @@ dbt-oss 2.0.8 has no `lsp` subcommand, so the server appears to live in the prop
 ### Anything else?
 
 Environment: dbt 2.0.8 (Fusion distribution), DuckDB adapter, macOS 27.0.1 on arm64, five dbt projects in one repository.
+
+Related: #16800 (`dbt lsp` stays silent when it cannot load the project).
