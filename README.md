@@ -4,7 +4,7 @@ refmux runs the dbt™ Fusion language server (`dbt lsp`) for every dbt project 
 
 Not affiliated with dbt Labs. Needs dbt Fusion, the `dbt` binary with the `lsp` subcommand; dbt-core and dbt-oss ship no language server.
 
-Status: 0.1. The proxy is tested over stdio against five dbt projects in one repository; the Zed extension is new and not yet tested inside Zed.
+Status: 0.1. The proxy is tested over stdio against five dbt projects in one repository. The Zed extension runs in Zed 1.24 on macOS: hover with parent and child models, one server per project. Its `lsp.refmux.settings` options are covered by unit tests.
 
 ## Why a proxy
 
