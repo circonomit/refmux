@@ -1,0 +1,12 @@
+id = "refmux-lsp"
+name = "Refmux for dbt"
+version = "0.1.0"
+schema_version = 1
+authors = ["Erik Müller"]
+description = "Runs the dbt Fusion language server for every dbt project in the worktree, routed by the nearest dbt_project.yml. Not affiliated with dbt Labs."
+repository = "https://github.com/circonomit/refmux"
+
+[language_servers.refmux]
+name = "Refmux for dbt"
+languages = ["SQL", "YAML"]
+language_ids = { SQL = "sql", YAML = "yaml" }

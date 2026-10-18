@@ -1,0 +1,15 @@
+[package]
+name = "refmux"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+description = "Runs one dbt Fusion language server per dbt project and routes each document to the server of its nearest dbt_project.yml"
+repository = "https://github.com/circonomit/refmux"
+publish = false
+
+[dependencies]
+serde_json = "1"
+url = "2"
+
+[workspace]
+exclude = ["editors/zed"]

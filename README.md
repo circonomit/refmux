@@ -1,0 +1,63 @@
+# Refmux for dbt
+
+refmux runs the dbt™ Fusion language server (`dbt lsp`) for every dbt project in a repository. Each document goes to the server of its nearest `dbt_project.yml`, so a monorepo with several dbt projects works without configuration in editors that start one language server per workspace, such as Zed.
+
+Not affiliated with dbt Labs. Needs dbt Fusion, the `dbt` binary with the `lsp` subcommand; dbt-core and dbt-oss ship no language server.
+
+Status: 0.1. The proxy is tested over stdio against five dbt projects in one repository; the Zed extension is new and not yet tested inside Zed.
+
+## Why a proxy
+
+`dbt lsp` serves one project per process. It needs `--project-dir`, ignores further workspace folders and does not advertise workspace-folder support (verified on 2.0.8). dbt's VS Code extension therefore runs one server per project and picks one by the active file's project root. Zed runs one server per worktree and reports subprojects as workspace folders, which `dbt lsp` ignores.
+
+This proxy does on the server side what the VS Code extension does on the client side. It becomes unnecessary once `dbt lsp` serves several projects itself; `docs/upstream/` holds the feature request draft.
+
+## How it works
+
+- **Routing**: a document belongs to the nearest `dbt_project.yml` above it. Installed packages (`dbt_packages/`, `dbt_modules/`) belong to the enclosing project.
+- **Lifecycle**: a project's server starts with the first document opened in it and stops once it has had no open documents for `--idle-timeout` (default 10 minutes). One server took 100–380 MB on the projects we measured.
+- **Other files**: SQL and YAML outside any dbt project get empty answers, never errors.
+- **Isolation**: request ids, progress tokens and capability registrations are namespaced per project (every `dbt lsp` registers its file watcher as `default-dbt-file-system-watcher`). A stopped server's diagnostics and watchers are withdrawn.
+- **Environment**: each server runs in its project directory, so dbt loads that project's `.env`. An `env_var('X')` without default in `profiles.yml` or `dbt_project.yml` that is neither set nor in `.env` gets a placeholder path under the temp directory: dbt cannot render the profile without it, and the server then stays silent. Static analysis does not open the warehouse; set the real value to use features that do, such as `dbt.show`.
+- **Capabilities** are pinned to what `dbt lsp` 2.0.8 advertises, since the client needs them before any server runs. A server that advertises different ones is logged.
+- **Formatting** is not advertised unless `--formatting` is given. Zed formats with the first server that offers it, so dbt's formatter would otherwise replace sqruff, sqlfluff or prettier.
+
+## Install
+
+```sh
+cargo install --locked --git https://github.com/circonomit/refmux
+```
+
+From a checkout: `cargo install --locked --path .`
+
+## Usage
+
+```
+refmux [OPTIONS] [-- <server command>...]
+
+The server command defaults to `dbt lsp`; --project-dir (and --profiles-dir when the
+project has a profiles.yml) are appended.
+
+Options:
+  --idle-timeout <seconds>  Stop a project's server after it has had no open documents
+                            for this long (default 600, 0 keeps servers running)
+  --formatting              Advertise dbt's document formatting
+  --no-env-placeholders     Do not fill unset env_var() references with placeholder paths
+```
+
+Any LSP client can start it as a stdio server. For Zed, see [`editors/zed`](editors/zed/README.md).
+
+## Known limitations
+
+- `dbt lsp` answers nothing for documents whose path differs from its canonical project path, for example a checkout reached through a symlink (macOS `/tmp` is one).
+- Fusion's parser flags some DuckDB syntax (`struct_pack(*columns)`, `unnest … with ordinality`) as `dbt0101` warnings. `--static-analysis off` in the server command silences them; hover, definition and completion keep working.
+- `dbt lsp` 2.0.8 analyses files as saved: after an edit, hover in that file stays empty until the file is saved. It offers no hover on model entries in schema YAML.
+- A server that crashes restarts with the next document opened in its project. Documents that were already open stay without answers until reopened or until the language server is restarted.
+
+## License
+
+Apache-2.0
+
+---
+
+dbt is a trademark of dbt Labs, LLC. This project is not affiliated with or endorsed by dbt Labs.
