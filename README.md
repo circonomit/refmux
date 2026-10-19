@@ -14,15 +14,17 @@ This proxy does on the server side what the VS Code extension does on the client
 
 ## How it works
 
-- **Routing**: a document belongs to the nearest `dbt_project.yml` above it. Installed packages (`dbt_packages/`, `dbt_modules/`) belong to the enclosing project.
+- **Routing**: a document belongs to the nearest `dbt_project.yml` above it. Installed packages (`dbt_packages/`, `dbt_modules/` or the project's `packages-install-path`) belong to the enclosing project.
 - **Lifecycle**: a project's server starts with the first document opened in it and stops once it has had no open documents for `--idle-timeout` (default 10 minutes). One server took 100–380 MB on the projects we measured.
 - **Other files**: SQL and YAML outside any dbt project get empty answers, never errors.
 - **Isolation**: request ids, progress tokens and capability registrations are namespaced per project (every `dbt lsp` registers its file watcher as `default-dbt-file-system-watcher`). A stopped server's diagnostics and watchers are withdrawn.
-- **Environment**: each server runs in its project directory, so dbt loads that project's `.env`. An `env_var('X')` without default in `profiles.yml` or `dbt_project.yml` that is neither set nor in `.env` gets a placeholder path under the temp directory: dbt cannot render the profile without it, and the server then stays silent. Static analysis does not open the warehouse; set the real value to use features that do, such as `dbt.show`.
+- **Environment**: each server runs in its project directory, so dbt loads that project's `.env`. An `env_var('X')` without default in `profiles.yml` or `dbt_project.yml` that is not set, not in `.env` and not given a default by another call (such as the active target's) gets a placeholder: `1` or `false` where dbt needs a number or a boolean (`threads`, `| as_number`, `| as_bool`), otherwise a path in a per-user directory (the temp directory on macOS and Windows, `$XDG_CACHE_HOME/refmux` or `~/.cache/refmux` elsewhere): dbt cannot render the profile without it, and the server then stays silent. Static analysis opens the warehouse only for hooks such as `on-run-start`, which `dbt lsp` runs on every compile, so with such hooks a DuckDB profile gets a scratch database at that path. Set the real value to use the real warehouse, for example for `dbt.show`.
 - **Capabilities** are pinned to what `dbt lsp` 2.0.8 advertises, since the client needs them before any server runs. A server that advertises different ones is logged.
 - **Formatting** is not advertised unless `--formatting` is given. Zed formats with the first server that offers it, so dbt's formatter would otherwise replace sqruff, sqlfluff or prettier.
 
 ## Install
+
+Needs Rust 1.88 or newer (the `rust-version` in `Cargo.toml`); run `rustup update` if cargo reports an older rustc.
 
 ```sh
 cargo install --locked --git https://github.com/circonomit/refmux
@@ -35,8 +37,9 @@ From a checkout: `cargo install --locked --path .`
 ```
 refmux [OPTIONS] [-- <server command>...]
 
-The server command defaults to `dbt lsp`; --project-dir (and --profiles-dir when the
-project has a profiles.yml) are appended.
+The server command defaults to `dbt lsp`; --project-dir is appended, and --profiles-dir
+when the project has a profiles.yml and neither the command nor DBT_PROFILES_DIR (also
+from the project's .env) names another.
 
 Options:
   --idle-timeout <seconds>  Stop a project's server after it has had no open documents

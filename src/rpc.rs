@@ -1,14 +1,15 @@
 use serde_json::Value;
-use std::io::{self, BufRead, Write};
+use std::io::{self, BufRead, Read, Write};
 
 /// Reads one `Content-Length`-framed JSON-RPC message; `Ok(None)` at end of stream.
 /// A body that is not valid JSON yields `InvalidData` after it was consumed, so callers can skip it.
+/// A malformed header yields another error kind: the frame boundary is lost, so callers must stop.
 pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
     let mut content_length = None;
     let mut line = String::new();
     loop {
         line.clear();
-        if reader.read_line(&mut line)? == 0 {
+        if reader.read_line(&mut line).map_err(io::Error::other)? == 0 {
             return Ok(None);
         }
         let header = line.trim_end_matches(['\r', '\n']);
@@ -21,17 +22,19 @@ pub fn read_message(reader: &mut impl BufRead) -> io::Result<Option<Value>> {
         if let Some((name, value)) = header.split_once(':')
             && name.trim().eq_ignore_ascii_case("content-length")
         {
-            let length = value.trim().parse::<usize>().map_err(|error| {
-                io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("Content-Length: {error}"),
-                )
-            })?;
+            let length = value
+                .trim()
+                .parse::<usize>()
+                .map_err(|error| io::Error::other(format!("Content-Length: {error}")))?;
             content_length = Some(length);
         }
     }
-    let mut body = vec![0; content_length.unwrap_or_default()];
-    reader.read_exact(&mut body)?;
+    // The buffer grows with the bytes that arrive, not with the length the peer claims.
+    let length = content_length.unwrap_or_default();
+    let mut body = Vec::new();
+    if reader.take(length as u64).read_to_end(&mut body)? < length {
+        return Err(io::ErrorKind::UnexpectedEof.into());
+    }
     serde_json::from_slice(&body)
         .map(Some)
         .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))
@@ -83,5 +86,19 @@ mod tests {
         let error = read_message(&mut reader).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::InvalidData);
         assert_eq!(read_message(&mut reader).unwrap().unwrap(), json!({}));
+    }
+
+    #[test]
+    fn stops_at_a_malformed_header() {
+        let raw = "Content-Length: abc\r\n\r\n{}Content-Length: 2\r\n\r\n{}";
+        let error = read_message(&mut Cursor::new(raw)).unwrap_err();
+        assert_ne!(error.kind(), io::ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn allocates_only_what_arrives() {
+        let raw = format!("Content-Length: {}\r\n\r\n{{}}", usize::MAX);
+        let error = read_message(&mut Cursor::new(raw)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

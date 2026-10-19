@@ -19,7 +19,8 @@ Usage: refmux [OPTIONS] [-- <server command>...]
 
 Runs one dbt Fusion language server per dbt project and routes every document to the
 server of its nearest dbt_project.yml. The server command defaults to `dbt lsp`;
---project-dir (and --profiles-dir when the project has a profiles.yml) are appended.
+--project-dir is appended, and --profiles-dir when the project has a profiles.yml and
+neither the command nor DBT_PROFILES_DIR (also from the project's .env) names another.
 
 Options:
   --idle-timeout <seconds>  Stop a project's server after it has had no open documents
@@ -67,6 +68,13 @@ fn parse_args(mut args: impl Iterator<Item = String>) -> Result<Option<Config>, 
     if config.server_command.is_empty() {
         config.server_command = vec!["dbt".into(), "lsp".into()];
     }
+    // Each server runs in its project directory, so resolve a relative program path here, once.
+    if let Some(program) = config.server_command.first_mut()
+        && program.contains(std::path::is_separator)
+        && let Ok(absolute) = std::path::absolute(&*program)
+    {
+        *program = absolute.to_string_lossy().into_owned();
+    }
     Ok(Some(config))
 }
 
@@ -84,6 +92,7 @@ fn main() -> ExitCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     fn parse(args: &[&str]) -> Config {
         parse_args(args.iter().map(|arg| arg.to_string()))
@@ -120,6 +129,15 @@ mod tests {
         );
         assert_eq!(config.idle_timeout, None);
         assert!(config.formatting);
+    }
+
+    #[test]
+    fn resolves_a_relative_program_path_against_the_working_directory() {
+        let config = parse(&["--", ".venv/bin/dbt", "lsp"]);
+        let program = Path::new(&config.server_command[0]);
+        assert!(program.is_absolute());
+        assert!(program.ends_with(".venv/bin/dbt"));
+        assert_eq!(parse(&["--", "dbt", "lsp"]).server_command[0], "dbt");
     }
 
     #[test]

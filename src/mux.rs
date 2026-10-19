@@ -3,7 +3,7 @@ use crate::project;
 use crate::rpc;
 use serde_json::{Value, json};
 use std::collections::{HashMap, HashSet};
-use std::io::{self, BufReader, BufWriter, Stdout};
+use std::io::{self, BufRead, BufReader, BufWriter, Stdout, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, ExitCode, Stdio};
 use std::sync::mpsc::{self, Receiver, Sender};
@@ -14,6 +14,8 @@ use url::Url;
 const INITIALIZE_ID: &str = "refmux/initialize";
 const SHUTDOWN_ID: &str = "refmux/shutdown";
 const TICK: Duration = Duration::from_secs(5);
+/// Generous, since a launcher such as `uv run` or `mise exec` may install dbt on first use.
+const STARTUP_TIMEOUT: Duration = Duration::from_secs(300);
 const STOP_GRACE: Duration = Duration::from_secs(5);
 const EXIT_WAIT: Duration = Duration::from_secs(2);
 
@@ -75,12 +77,13 @@ struct Project {
     dir: PathBuf,
     child: Child,
     to_child: Sender<Value>,
+    started: Instant,
     ready: bool,
     queue: Vec<Value>,
     open_documents: HashSet<String>,
     idle_since: Option<Instant>,
     diagnosed: HashSet<String>,
-    /// Client requests forwarded to this server, keyed like `Mux::client_requests`.
+    /// Client requests forwarded to this server, keyed by `id_key` of the client's id.
     pending: HashMap<String, Value>,
     /// Namespaced registration id -> method, unregistered at the client when the server stops.
     registrations: HashMap<String, String>,
@@ -95,7 +98,6 @@ struct Mux {
     projects: HashMap<u32, Project>,
     project_by_dir: HashMap<PathBuf, u32>,
     documents: HashMap<String, u32>,
-    client_requests: HashMap<String, u32>,
     /// Server-to-client requests get mux-wide ids, since every server numbers its own from 1.
     server_requests: HashMap<i64, (u32, Value)>,
     next_server_request_id: i64,
@@ -113,44 +115,27 @@ pub fn run(config: Config) -> ExitCode {
     spawn_client_reader(events.clone());
     spawn_ticker(events.clone());
     let mut mux = Mux::new(config, events);
-    for event in inbox {
+    // Borrowed, so the receiver outlives `stop_all`: server reader threads keep draining stdout.
+    for event in &inbox {
         match event {
             Event::Client(message) => {
-                if let Some(code) = mux.on_client(message) {
-                    return code;
+                if mux.on_client(message) {
+                    break;
                 }
             }
-            Event::ClientClosed => {
-                mux.stop_all();
-                return mux.exit_code();
-            }
+            Event::ClientClosed => break,
             Event::Server(id, message) => mux.on_server(id, message),
             Event::ServerClosed(id) => mux.on_server_closed(id),
             Event::Tick => mux.on_tick(),
         }
     }
-    ExitCode::SUCCESS
+    mux.stop_all();
+    mux.exit_code()
 }
 
 fn spawn_client_reader(events: Sender<Event>) {
-    thread::spawn(move || {
-        let mut reader = BufReader::new(io::stdin().lock());
-        loop {
-            match rpc::read_message(&mut reader) {
-                Ok(Some(message)) => {
-                    if events.send(Event::Client(message)).is_err() {
-                        return;
-                    }
-                }
-                Ok(None) => break,
-                Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    eprintln!("refmux: skipping malformed client message: {error}");
-                }
-                Err(_) => break,
-            }
-        }
-        let _ = events.send(Event::ClientClosed);
-    });
+    let open = || io::stdin().lock();
+    spawn_reader(open, "client", Event::Client, Event::ClientClosed, events);
 }
 
 fn spawn_ticker(events: Sender<Event>) {
@@ -165,25 +150,61 @@ fn spawn_ticker(events: Sender<Event>) {
 }
 
 fn spawn_server_reader(id: u32, stdout: ChildStdout, events: Sender<Event>) {
+    let open = move || BufReader::new(stdout);
+    let event = move |message| Event::Server(id, message);
+    spawn_reader(open, "server", event, Event::ServerClosed(id), events);
+}
+
+/// Sends every message as an event, skipping malformed ones, then `closed` at end of stream.
+/// `open` runs on the new thread, since a `StdinLock` cannot be sent to one.
+fn spawn_reader<R: BufRead>(
+    open: impl FnOnce() -> R + Send + 'static,
+    side: &'static str,
+    event: impl Fn(Value) -> Event + Send + 'static,
+    closed: Event,
+    events: Sender<Event>,
+) {
     thread::spawn(move || {
-        let mut reader = BufReader::new(stdout);
+        let mut reader = open();
         loop {
             match rpc::read_message(&mut reader) {
                 Ok(Some(message)) => {
-                    if events.send(Event::Server(id, message)).is_err() {
+                    if events.send(event(message)).is_err() {
                         return;
                     }
                 }
                 Ok(None) => break,
                 Err(error) if error.kind() == io::ErrorKind::InvalidData => {
-                    eprintln!("refmux: skipping malformed server message: {error}");
+                    let _ = writeln!(
+                        io::stderr(),
+                        "refmux: skipping malformed {side} message: {error}"
+                    );
                 }
-                Err(_) => break,
+                Err(error) => {
+                    let _ = writeln!(io::stderr(), "refmux: cannot read from the {side}: {error}");
+                    break;
+                }
             }
         }
-        let _ = events.send(Event::ServerClosed(id));
+        let _ = events.send(closed);
     });
 }
+
+/// SIGKILLs the process group `start_project` gave the child. Only for a child that `try_wait`
+/// just found running: until it is reaped, its pid (the group id) cannot be reused.
+#[cfg(unix)]
+fn kill_group(child: &Child) {
+    unsafe extern "C" {
+        safe fn kill(pid: i32, signal: i32) -> i32;
+    }
+    const SIGKILL: i32 = 9;
+    if let Ok(pid) = i32::try_from(child.id()) {
+        let _ = kill(-pid, SIGKILL);
+    }
+}
+
+#[cfg(not(unix))]
+fn kill_group(_child: &Child) {}
 
 /// Dropping the project's sender ends this thread, which closes the server's stdin.
 fn spawn_server_writer(stdin: ChildStdin, inbox: Receiver<Value>) {
@@ -220,6 +241,11 @@ fn token_text(token: &Value) -> String {
         .map_or_else(|| token.to_string(), str::to_owned)
 }
 
+/// Ids, tokens and registrations as the client sees them, unique across projects.
+fn namespaced(project: u32, original: &str) -> String {
+    format!("refmux/{project}/{original}")
+}
+
 fn is_file_operation(method: &str) -> bool {
     matches!(
         method,
@@ -243,7 +269,6 @@ impl Mux {
             projects: HashMap::new(),
             project_by_dir: HashMap::new(),
             documents: HashMap::new(),
-            client_requests: HashMap::new(),
             server_requests: HashMap::new(),
             next_server_request_id: 1,
             progress_tokens: HashMap::new(),
@@ -265,7 +290,8 @@ impl Mux {
 
     // ---- client -> mux ----
 
-    fn on_client(&mut self, message: Value) -> Option<ExitCode> {
+    /// Returns true once the client sent `exit`.
+    fn on_client(&mut self, message: Value) -> bool {
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -280,10 +306,7 @@ impl Mux {
                 self.stop_all();
                 self.reply(id, Value::Null);
             }
-            (Some("exit"), None) => {
-                self.stop_all();
-                return Some(self.exit_code());
-            }
+            (Some("exit"), None) => return true,
             (Some(_), Some(id)) if self.shutdown_requested => {
                 self.reply_error(id, INVALID_REQUEST, "the server is shutting down");
             }
@@ -303,11 +326,16 @@ impl Mux {
             }
             _ => {}
         }
-        None
+        false
     }
 
     fn on_initialize(&mut self, id: Value, message: &Value) {
-        self.initialize_params = message.get("params").cloned().unwrap_or(Value::Null);
+        // `start_project` adds fields to a copy for each server, which only an object allows.
+        self.initialize_params = message
+            .get("params")
+            .cloned()
+            .filter(Value::is_object)
+            .unwrap_or_else(|| json!({}));
         let mut capabilities = dbt_lsp_capabilities();
         if !self.config.formatting
             && let Some(map) = capabilities.as_object_mut()
@@ -331,7 +359,10 @@ impl Mux {
             return;
         };
         message["id"] = original;
-        self.forward(project, message);
+        // Answers skip the startup queue: a server may wait for one before it answers `initialize`.
+        if let Some(project) = self.projects.get(&project) {
+            let _ = project.to_child.send(message);
+        }
     }
 
     fn on_document(&mut self, method: &str, id: Option<Value>, message: Value) {
@@ -343,10 +374,8 @@ impl Mux {
             if method == "textDocument/didOpen" {
                 self.open_document(uri)
             } else {
-                self.documents
-                    .get(uri)
-                    .copied()
-                    .or_else(|| self.running_project_for(uri))
+                // After a crash the restarted server never got `didOpen` for documents opened before.
+                self.documents.get(uri).copied()
             }
         });
         let Some(target) = target else {
@@ -384,14 +413,21 @@ impl Mux {
     }
 
     fn running_project_for(&self, uri: &str) -> Option<u32> {
-        let dir = project::find_project(&uri_to_path(uri)?)?;
+        let path = uri_to_path(uri)?;
+        // Most such URIs lie outside every running project; skip the walk up the tree for them.
+        if !self.project_by_dir.keys().any(|dir| path.starts_with(dir)) {
+            return None;
+        }
+        let dir = project::find_project(&path)?;
         self.project_by_dir.get(&dir).copied()
     }
 
     fn on_cancel(&mut self, message: Value) {
-        let target = message
-            .pointer("/params/id")
-            .and_then(|id| self.client_requests.get(&id_key(id)).copied());
+        let target = message.pointer("/params/id").map(id_key).and_then(|key| {
+            self.projects
+                .iter()
+                .find_map(|(id, project)| project.pending.contains_key(&key).then_some(*id))
+        });
         if let Some(target) = target {
             self.forward(target, message);
         }
@@ -441,22 +477,27 @@ impl Mux {
         }
     }
 
+    /// A command about a file runs on that file's server or nowhere; only one without a file
+    /// goes to the last active project.
     fn on_execute_command(&mut self, id: Value, message: Value) {
-        let target = message
+        let uri = message
             .pointer("/params/arguments")
-            .and_then(first_file_uri)
-            .and_then(|uri| {
-                self.documents
-                    .get(&uri)
-                    .copied()
-                    .or_else(|| self.running_project_for(&uri))
-            })
-            .or(self.last_active.filter(|id| self.projects.contains_key(id)));
-        let Some(target) = target else {
-            self.reply_error(id, REQUEST_FAILED, "no dbt project server is running");
-            return;
+            .and_then(first_file_uri);
+        let target = match &uri {
+            Some(uri) => self
+                .documents
+                .get(uri)
+                .copied()
+                .or_else(|| self.running_project_for(uri)),
+            None => self.last_active.filter(|id| self.projects.contains_key(id)),
         };
-        self.forward_request_or_notification(target, Some(id), message);
+        match (target, uri) {
+            (Some(target), _) => self.forward_request_or_notification(target, Some(id), message),
+            (None, Some(_)) => self.reply(id, Value::Null),
+            (None, None) => {
+                self.reply_error(id, REQUEST_FAILED, "no dbt project server is running")
+            }
+        }
     }
 
     fn on_file_operation(&mut self, id: Option<Value>, message: Value) {
@@ -473,12 +514,10 @@ impl Mux {
     }
 
     fn forward_request_or_notification(&mut self, target: u32, id: Option<Value>, message: Value) {
-        if let Some(id) = id {
-            let key = id_key(&id);
-            self.client_requests.insert(key.clone(), target);
-            if let Some(project) = self.projects.get_mut(&target) {
-                project.pending.insert(key, id);
-            }
+        if let Some(id) = id
+            && let Some(project) = self.projects.get_mut(&target)
+        {
+            project.pending.insert(id_key(&id), id);
         }
         self.forward(target, message);
     }
@@ -498,7 +537,7 @@ impl Mux {
 
     fn start_project(&mut self, dir: &Path) -> Option<u32> {
         let (program, base_args) = self.config.server_command.split_first()?;
-        let profiles = project::profiles(dir);
+        let profiles = project::profiles(dir, base_args);
         let mut command = Command::new(program);
         command
             .args(base_args)
@@ -508,6 +547,10 @@ impl Mux {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit());
+        // Its own process group, so that a forced stop also reaches dbt behind a wrapper such as
+        // `uv run`, which keeps dbt as its child instead of exec'ing it.
+        #[cfg(unix)]
+        std::os::unix::process::CommandExt::process_group(&mut command, 0);
         if let Some(profiles_dir) = &profiles.flag {
             command.arg("--profiles-dir").arg(profiles_dir);
         }
@@ -521,20 +564,15 @@ impl Mux {
         let mut child = match command.spawn() {
             Ok(child) => child,
             Err(error) => {
-                if self.failed_dirs.insert(dir.to_path_buf()) {
-                    let command_line = self.config.server_command.join(" ");
-                    self.show(
-                        ERROR,
-                        format!(
-                            "could not start `{command_line}` for {}: {error}",
-                            dir.display()
-                        ),
-                    );
-                }
+                let command_line = self.config.server_command.join(" ");
+                let text = format!(
+                    "could not start `{command_line}` for {}: {error}",
+                    dir.display()
+                );
+                self.report_startup_failure(dir, text);
                 return None;
             }
         };
-        self.failed_dirs.remove(dir);
         let id = self.next_project_id;
         self.next_project_id += 1;
         let (stdin, stdout) = (child.stdin.take()?, child.stdout.take()?);
@@ -566,6 +604,13 @@ impl Mux {
         params["rootUri"] = json!(uri);
         params["rootPath"] = json!(dir.display().to_string());
         params["workspaceFolders"] = json!([{"uri": uri, "name": name}]);
+        // The client only sees the pinned capabilities, so positions must stay in the UTF-16 default.
+        if let Some(general) = params
+            .pointer_mut("/capabilities/general")
+            .and_then(Value::as_object_mut)
+        {
+            general.remove("positionEncodings");
+        }
         let _ = to_child.send(json!({
             "jsonrpc": "2.0",
             "id": INITIALIZE_ID,
@@ -579,6 +624,7 @@ impl Mux {
                 dir: dir.to_path_buf(),
                 child,
                 to_child,
+                started: Instant::now(),
                 ready: false,
                 queue: Vec::new(),
                 open_documents: HashSet::new(),
@@ -625,6 +671,19 @@ impl Mux {
                 match method.as_str() {
                     "$/progress" => self.namespace_progress(id, &mut message),
                     "textDocument/publishDiagnostics" => self.track_diagnostics(id, &message),
+                    "$/cancelRequest" => {
+                        // The client knows the request by its mux-wide id; drop a cancel for one it never got.
+                        let original = message.pointer("/params/id");
+                        let Some(mux_id) = self
+                            .server_requests
+                            .iter()
+                            .find(|(_, (owner, request))| *owner == id && Some(request) == original)
+                            .map(|(mux_id, _)| *mux_id)
+                        else {
+                            return;
+                        };
+                        message["params"]["id"] = json!(mux_id);
+                    }
                     _ => {}
                 }
                 self.send(&message);
@@ -638,13 +697,8 @@ impl Mux {
             self.on_project_ready(id, &message);
             return;
         }
-        if *response_id == SHUTDOWN_ID {
-            return;
-        }
-        let key = id_key(response_id);
-        self.client_requests.remove(&key);
         if let Some(project) = self.projects.get_mut(&id) {
-            project.pending.remove(&key);
+            project.pending.remove(&id_key(response_id));
         }
         self.send(&message);
     }
@@ -652,13 +706,11 @@ impl Mux {
     fn on_project_ready(&mut self, id: u32, message: &Value) {
         if let Some(error) = message.get("error") {
             if let Some(project) = self.remove_project(id) {
-                self.show(
-                    ERROR,
-                    format!(
-                        "dbt lsp for {} rejected initialize: {error}",
-                        project.dir.display()
-                    ),
+                let text = format!(
+                    "dbt lsp for {} rejected initialize: {error}",
+                    project.dir.display()
                 );
+                self.report_startup_failure(&project.dir, text);
                 self.stop(project);
             }
             return;
@@ -667,6 +719,7 @@ impl Mux {
             return;
         };
         project.ready = true;
+        self.failed_dirs.remove(&project.dir);
         let _ = project
             .to_child
             .send(json!({"jsonrpc": "2.0", "method": "initialized", "params": {}}));
@@ -701,7 +754,7 @@ impl Mux {
         let Some(token) = message.pointer("/params/token").cloned() else {
             return;
         };
-        let namespaced = format!("refmux/{id}/{}", token_text(&token));
+        let namespaced = namespaced(id, &token_text(&token));
         self.progress_tokens.insert(namespaced.clone(), (id, token));
         message["params"]["token"] = json!(namespaced);
     }
@@ -711,7 +764,7 @@ impl Mux {
         let Some(token) = message.pointer("/params/token") else {
             return;
         };
-        let namespaced = format!("refmux/{id}/{}", token_text(token));
+        let namespaced = namespaced(id, &token_text(token));
         if !self.progress_tokens.contains_key(&namespaced) {
             return;
         }
@@ -743,7 +796,7 @@ impl Mux {
             ) else {
                 continue;
             };
-            let namespaced = format!("refmux/{id}/{original}");
+            let namespaced = namespaced(id, original);
             project
                 .registrations
                 .insert(namespaced.clone(), method.to_owned());
@@ -766,7 +819,7 @@ impl Mux {
             let Some(original) = unregistration.get("id").and_then(Value::as_str) else {
                 continue;
             };
-            let namespaced = format!("refmux/{id}/{original}");
+            let namespaced = namespaced(id, original);
             project.registrations.remove(&namespaced);
             unregistration["id"] = json!(namespaced);
         }
@@ -795,7 +848,10 @@ impl Mux {
         };
         let status = match project.child.try_wait() {
             Ok(Some(status)) => status.to_string(),
-            _ => {
+            running => {
+                if running.is_ok() {
+                    kill_group(&project.child);
+                }
                 let _ = project.child.kill();
                 project
                     .child
@@ -811,12 +867,10 @@ impl Mux {
             );
         } else {
             let command_line = self.config.server_command.join(" ");
-            self.show(
-                ERROR,
-                format!(
-                    "dbt lsp for {dir} exited during startup ({status}); `{command_line}` must be dbt Fusion (dbt-core and dbt-oss have no `lsp` subcommand)"
-                ),
+            let text = format!(
+                "dbt lsp for {dir} exited during startup ({status}); its error output is in the language server log. `{command_line}` must run dbt Fusion: dbt-core and dbt-oss have no `lsp` subcommand"
             );
+            self.report_startup_failure(&project.dir, text);
         }
         self.release(&project);
     }
@@ -824,6 +878,23 @@ impl Mux {
     // ---- lifecycle ----
 
     fn on_tick(&mut self) {
+        let stalled: Vec<u32> = self
+            .projects
+            .iter()
+            .filter(|(_, project)| !project.ready && project.started.elapsed() >= STARTUP_TIMEOUT)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in stalled {
+            if let Some(project) = self.remove_project(id) {
+                let text = format!(
+                    "dbt lsp for {} did not answer initialize within {} s; open a file there to retry",
+                    project.dir.display(),
+                    STARTUP_TIMEOUT.as_secs()
+                );
+                self.report_startup_failure(&project.dir, text);
+                self.stop(project);
+            }
+        }
         if let Some(timeout) = self.config.idle_timeout {
             let idle: Vec<u32> = self
                 .projects
@@ -855,9 +926,20 @@ impl Mux {
         let project = self.projects.remove(&id)?;
         self.project_by_dir.remove(&project.dir);
         self.documents.retain(|_, owner| *owner != id);
-        self.client_requests.retain(|_, owner| *owner != id);
         self.server_requests.retain(|_, (owner, _)| *owner != id);
-        self.progress_tokens.retain(|_, (owner, _)| *owner != id);
+        // Nothing else ends the progress the client still shows for this server.
+        let tokens: Vec<String> = self
+            .progress_tokens
+            .extract_if(|_, (owner, _)| *owner == id)
+            .map(|(token, _)| token)
+            .collect();
+        for token in tokens {
+            self.send(&json!({
+                "jsonrpc": "2.0",
+                "method": "$/progress",
+                "params": {"token": token, "value": {"kind": "end"}}
+            }));
+        }
         if self.last_active == Some(id) {
             self.last_active = None;
         }
@@ -892,10 +974,14 @@ impl Mux {
 
     fn reap_stopping(&mut self, force: bool) {
         self.stopping.retain_mut(|(child, since)| {
-            if matches!(child.try_wait(), Ok(Some(_))) {
-                return false;
-            }
+            let running = match child.try_wait() {
+                Ok(Some(_)) => return false,
+                result => result.is_ok(),
+            };
             if force || since.elapsed() >= STOP_GRACE {
+                if running {
+                    kill_group(child);
+                }
                 let _ = child.kill();
                 let _ = child.wait();
                 return false;
@@ -940,7 +1026,7 @@ impl Mux {
 
     fn send(&mut self, message: &Value) {
         if let Err(error) = rpc::write_message(&mut self.out, message) {
-            eprintln!("refmux: cannot write to the client: {error}");
+            let _ = writeln!(io::stderr(), "refmux: cannot write to the client: {error}");
         }
     }
 
@@ -972,6 +1058,15 @@ impl Mux {
             "method": "window/showMessage",
             "params": {"type": kind, "message": format!("refmux: {text}")}
         }));
+    }
+
+    /// Every didOpen retries a project that failed to start; only the first failure pops up.
+    fn report_startup_failure(&mut self, dir: &Path, text: String) {
+        if self.failed_dirs.insert(dir.to_path_buf()) {
+            self.show(ERROR, text);
+        } else {
+            self.log(ERROR, text);
+        }
     }
 }
 
