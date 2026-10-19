@@ -2,6 +2,7 @@
 name = "refmux"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Runs one dbt Fusion language server per dbt project and routes each document to the server of its nearest dbt_project.yml"
 repository = "https://github.com/circonomit/refmux"
